@@ -23,29 +23,29 @@ model.add(Dense(106, activation='softmax', use_bias=True))
 model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy', 'categorical_accuracy'])
 print(model.summary())
 
-train = pd.read_csv('csvs/train.csv')
+train = pd.read_csv('dataset/train.csv')
 train['class_number'] = train['class_number'].astype(str)
 train_generator = ImageDataGenerator(rescale=1. / 255).flow_from_dataframe(
-    dataframe=train, directory="train/",
+    dataframe=train, directory="dataset/train/",
     x_col="filename", y_col="class_number",
     class_mode="categorical", target_size=(48, 48),
     batch_size=64, seed=42
 )
-validation = pd.read_csv('csvs/validation.csv')
+validation = pd.read_csv('dataset/validation.csv')
 validation['class_number'] = validation['class_number'].astype(str)
 validation_generator = ImageDataGenerator(rescale=1. / 255).flow_from_dataframe(
-    dataframe=validation, directory="validation/",
+    dataframe=validation, directory="dataset/validation/",
     x_col="filename", y_col="class_number",
     class_mode="categorical", target_size=(48, 48),
     batch_size=64, seed=42
 )
 
-save_generator_labels('csvs/labels.csv', train_generator.class_indices)
+save_generator_labels('dataset/labels.csv', train_generator.class_indices)
 checkpoints = ModelCheckpoint('results/models/{epoch}.h5', period=25)
-tb_logger = TensorBoard(log_dir='results/tb_logs', write_images=True)
+tb_logger = TensorBoard(log_dir='results/tb_logs/', write_images=True)
 csv_logger = CSVLogger('results/log.csv')
 class_weights = compute_class_weights(
-    'classes_count.csv',
+    'dataset/classes_count.csv',
     name_label='class_number',
     count_label='count'
 )
