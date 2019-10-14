@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from keras.models import load_model
 from keras_preprocessing.image import ImageDataGenerator
 from playsound import playsound
@@ -26,6 +27,10 @@ prediction_generator = ImageDataGenerator(rescale=1./255).flow_from_dataframe(
 )
 
 predictions = model.predict_generator(generator=prediction_generator, verbose=1, workers=4)
-print(get_predictions_with_prob('dataset/labels.csv', predictions))
+df_pred = pd.DataFrame.from_dict(get_predictions_with_prob('dataset/labels.csv', predictions), orient='index')
+df_classes = pd.read_csv('dataset/predict.csv')
+df_classes = pd.concat([df_classes, df_pred], axis=1)
+df_classes['result'] = np.where(df_classes['class_number'] == df_classes['prediction'], 1, 0)
+df_classes.to_csv('results/final.csv', index='False')
 
 playsound('misc/microwave.mp3')

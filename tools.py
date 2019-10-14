@@ -17,7 +17,8 @@ def save_generator_labels(filename, classes):
 def get_predictions_with_prob(filename, predictions):
     classes = predictions.argmax(axis=-1)
     labels = pd.read_csv(filename)
-    result = []
+    result = {}
     for i in range(len(classes)):
-        result.append([labels.iloc[classes[i], :]['class'], predictions[i][classes[i]]])
+        result[i] = {'prediction': labels.iloc[classes[i], :]['class'],
+                     'probability': predictions[i][classes[i]]}
     return result

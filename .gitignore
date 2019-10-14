@@ -1,0 +1,6 @@
+# Directories
+/dataset/
+/.ipynb_checkpoints/
+/venv/
+/.idea/
+/__pycache__/
