@@ -1,0 +1,6 @@
+/.idea/
+/.ipynb_checkpoints/
+/__pycache__/
+/sources/__pycache__/
+/venv/
+/dataset/
