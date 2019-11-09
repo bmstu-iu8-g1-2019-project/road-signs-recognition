@@ -4,3 +4,6 @@
 /sources/__pycache__/
 /venv/
 /dataset/
+/full.csv
+/new-full-gt.csv
+/weights.csv

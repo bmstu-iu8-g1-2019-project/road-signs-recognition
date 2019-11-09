@@ -2,7 +2,7 @@ from keras.layers import Input, Conv2D, MaxPooling2D, AveragePooling2D, Dense, F
 from keras.models import Model
 from layers import residual_block
 
-input = Input(shape=(960, 540, 3))
+input = Input(shape=(1280, 720, 3))
 output = Conv2D(
     filters=32,
     kernel_size=5,
@@ -33,6 +33,7 @@ output = Dropout(
 output = Dense(
     units=106, activation='sigmoid')(output)
 model = Model(inputs=input, outputs=output)
-model.compile(optimizer='adam', loss='categorical_crossentropy')
+model.compile(optimizer='adam', loss='binary_crossentropy')
 
-# TODO(Mocurin): Add data generators and fitting
+
+
