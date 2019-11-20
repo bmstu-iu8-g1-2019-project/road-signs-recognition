@@ -40,16 +40,14 @@ def indicator_vector(size, indices_arr):
     return arr
 
 
-def cls_reg_wrapper(generator, cls_indices_dict):
+def cls_wrapper(generator, cls_indices_dict):
     """Simply arranges an output of generator to match a model
     with a [cls, reg] output"""
     size = len(cls_indices_dict)
     for img, row in generator:
-        arr = np.array(row)
-        cls = arr[:, 0].ravel()
+        cls = np.array(row)
         cls = np.array([indicator_vector(size, cls_indices_dict[name]) for name in cls])
-        reg = arr[:, [1, 2]]
-        yield img, [cls, reg]
+        yield img, cls
 
 
 def class_weights_array(cls_indices_dict, cls_weights_dict):
