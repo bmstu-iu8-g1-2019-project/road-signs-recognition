@@ -7,3 +7,6 @@
 /full.csv
 /new-full-gt.csv
 /weights.csv
+/misc/
+/feature_extractor/
+/tests/
