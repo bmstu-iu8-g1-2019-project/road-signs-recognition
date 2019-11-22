@@ -14,23 +14,18 @@ def name_generator(init=0, numbers=4, img_format='.png'):
         index += 1
 
 
-def unify_model(model):
+def unify_model(model, index):
     model_config = model.get_config()
     model_weights = model.get_weights()
+    model_weights = model_weights[:index + 1]
     model_config['layers'][0]['config']['batch_input_shape'] = (None, None, None, 3)
+    model_config['layers'] = model_config['layers'][:index + 1]
     model_config['output_layers'] = []
-    met_conv = False
     for ind in reversed(range(len(model_config['layers']))):
         if model_config['layers'][ind]['class_name'] == 'Conv2D':
             model_config['output_layers'].append(
                 [model_config['layers'][ind]['name'], 0, 0]
             )
-            if not met_conv:
-                met_conv=True
-            continue
-        if not met_conv:
-            model_config['layers'].pop(ind)
-            model_weights.pop(ind)
     new_model = Model.from_config(model_config)
     new_model.set_weights(model_weights)
     return new_model
@@ -52,7 +47,7 @@ def get_filename_template(path_to, symbol, ending):
     return tmp
 
 
-def get_legend_template(font_path, *, font_size=14, position=(0, 0), color=(0, 0, 0)):
+def get_legend_template(font_path, *, font_size=18, position=(0, 0), color=(0, 0, 0)):
     font = ImageFont.truetype(font_path, font_size)
     def tmp(image, text):
         draw = ImageDraw.Draw(image)
@@ -68,8 +63,8 @@ def get_legend_text(value, depth, conv):
         .format(str(value), str(depth), str(conv))
 
 
-def visualize_feature_maps(model, image_paths, path_to, *, clear_to=False):
-    new_model = unify_model(model)
+def visualize_feature_maps(index, model, image_paths, path_to, *, clear_to=False):
+    new_model = unify_model(model, index)
     if clear_to and os.listdir(path_to):
         sh.rmtree(path_to, ignore_errors=True)
         os.mkdir(path_to)
@@ -144,17 +139,23 @@ def collect_and_arrange_images(images_path, conv_targets, path_to, *, grid_size=
 
 
 if __name__ == '__main__':
-    model = load_model('../feature_extractor/model.h5')
+    model = load_model('../feature_extractor/200.h5')
+    visualize_feature_maps(7, model, ['../feature_extractor/01.jpg',
+                                      '../feature_extractor/02.jpg',
+                                      '../feature_extractor/03.jpg',
+                                      '../feature_extractor/04.jpg',
+                                      '../feature_extractor/05.jpg',
+                                      '../feature_extractor/06.jpg'],
+                           '../feature_extractor/new_feature_maps/',
+                           clear_to=True)
     collect_and_arrange_images(['../feature_extractor/new_feature_maps/0_image/',
                                 '../feature_extractor/new_feature_maps/1_image/',
                                 '../feature_extractor/new_feature_maps/2_image/',
                                 '../feature_extractor/new_feature_maps/3_image/'],
-                               ['2_conv/',
+                               ['0_conv/',
+                                '1_conv/',
+                                '2_conv/',
                                 '3_conv/',
                                 '4_conv/'],
                                '../feature_extractor/combined/',
                                clear_to=True)
-    # visualize_feature_maps(model, ['../tests/test_0.jpg',
-    #                                '../tests/test_2.jpg',
-    #                                '../tests/test_3.jpg',
-    #                                '../tests/test_4.jpg'], '../feature_extractor/new_feature_maps/', clear_to=True)
