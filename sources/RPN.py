@@ -1,79 +1,168 @@
 from keras.layers import Conv2D, Lambda
 from keras.models import Input, Model
-from keras.losses import binary_crossentropy, huber_loss
+from keras.utils import plot_model
+from keras.initializers import he_uniform, glorot_uniform
 import keras.backend as K
 import tensorflow as tf
 import numpy as np
 
 
-def create_rpn_model(input_shape, ab_per_fm_point=9):
-    """Model architecture"""
-    feature_map = Input(shape=input_shape)
-    conv_layer = Conv2D(
-        filters=128,
-        kernel_size=(3, 3),
-        padding='same'
-    )(feature_map)
-    cls = Conv2D(
-        filters=ab_per_fm_point,
-        kernel_size=(1, 1),
-        activation="sigmoid",
-        kernel_initializer="uniform",
-        name="RPN_cls"
-    )(conv_layer)
-    # Reshape into (-1, 1)
-    cls = Lambda(lambda x: tf.reshape(x, [tf.shape(x)[0], -1, 1]))(cls)
-    reg = Conv2D(
-        filters=4 * ab_per_fm_point,
-        kernel_size=(1, 1),
-        activation="linear",
-        kernel_initializer="uniform",
-        name="RPN_reg"
-    )(conv_layer)
-    # Reshape into (-1, 4)
-    reg = Lambda(lambda x: tf.reshape(x, [tf.shape(x)[0], -1, 4]))(reg)
-    model = Model(inputs=[feature_map], outputs=[cls, reg])
-    model.compile(optimizer='adadelta', loss={'RPN_cls': cls_loss, 'RPN_reg': bbox_loss})
+def prepare_pretrained_model(model, crop_index, lock_index, input_shape=(1280, 720, 3), name='FeatureExtractor'):
+    """Crops model and locks layers from training
+    Receives:
+        model - pretrained model
+        crop_index - index of last layer in final model
+        lock_index - index of last locked layer in final model
+        input_shape - since model is convolutional, input could be freely changed
+        name - optional model name
+    Return:
+        new cropped model
+    """
+    # The only viable option, besides rebuilding the whole model, is to edit model config
+    config = model.get_config()
+    weights = model.get_weights()
+
+    # Change name
+    config['name'] = name
+
+    # Edit input layer
+    config['layers'][0]['config']['batch_input_shape'] = (None, *input_shape)
+
+    # Crop unnecessary layers
+    config['layers'] = config['layers'][:crop_index + 1]
+
+    # Assign new model output
+    config['output_layers'][0][0] = config['layers'][-1]['name']
+
+    # Build cropped model from config and load weights
+    model = Model.from_config(config)
+    model.set_weights(weights)
+    for i in range(lock_index + 1):
+        model.layers[i].trainable = False
     return model
 
 
-def cls_loss(target_labels, predicted_label):
-    """binary_crossentropy loss wrapper. Ignores anchor boxes labeled as neutral
-    during training"""
-    target_labels = tf.squeeze(target_labels, -1)
-    contributing_indices = tf.where(tf.not_equal(target_labels, -1))
-    target_labels = tf.gather_nd(target_labels, contributing_indices)
-    contributing_prediction = tf.gather_nd(predicted_label, contributing_indices)
-    loss = K.binary_crossentropy(target=target_labels,
-                                 output=contributing_prediction)
-    # Zero batch size case
-    return K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
+def create_rpn_model(model, *, conv_kernels=128, k=9, seed=42):
+    """RPN model consists of convolutional layer, which receives feature maps from pretrained model,
+    and two heads. Classification head computes a score (how 'signy' (from 0 to 1) insides of respective anchor
+    boxes are, in my case), Regression head computes special deltas, which after their application
+    on respective anchor box make it better contain object inside
+    Receives: feature map
+    Outputs: (N, 1) scores
+             (N, 4) deltas"""
+    conv_layer = Conv2D(
+        filters=conv_kernels,
+        kernel_size=3,
+        padding='same',
+        kernel_initializer=he_uniform(seed),
+        activation='relu',
+        name='RPN_conv'
+    )(model.output)
+    # Get (fm_width, fm_height, k) tensor
+    cls = Conv2D(
+        filters=k,
+        kernel_size=1,
+        kernel_initializer=glorot_uniform(seed),
+        activation='sigmoid',
+        name='RPN_cls'
+    )(conv_layer)
+    # Reshape into (-1, 1)
+    cls = Lambda(lambda x: tf.reshape(x, [tf.shape(x)[0], -1, 1]),
+                 name='bbox_cls')(cls)
+    # Get (fm_width, fm_height, k * 4) tensor
+    reg = Conv2D(
+        filters=4 * k,
+        kernel_size=1,
+        kernel_initializer=glorot_uniform(seed),
+        activation='linear',
+        name='RPN_reg'
+    )(conv_layer)
+    # Reshape into (-1, 4)
+    reg = Lambda(lambda x: tf.reshape(x, [tf.shape(x)[0], -1, 4]),
+                 name='bbox_reg')(reg)
+    model = Model(inputs=model.input, outputs=[cls, reg], name='RPN')
+    # Make losses
+    cls_loss = make_cls_processer(tf.keras.losses.binary_crossentropy)
+    reg_loss = make_reg_processer(tf.keras.losses.Huber())
+    # Make metrics
+    cls_acc = make_cls_processer(tf.keras.metrics.binary_accuracy, name='acc')
+    reg_mae = make_reg_processer(tf.keras.metrics.mean_absolute_error, name='acc')
+    model.compile(optimizer='adadelta',
+                  loss={'bbox_cls': cls_loss, 'bbox_reg': reg_loss},
+                  metrics={'bbox_cls': cls_acc, 'bbox_reg': reg_mae})
+    return model
 
 
-def bbox_loss(target_deltas, target_labels, predicted_deltas):
-    """huber_loss wrapper. Ignores anchor boxes labeled as negative or neutral"""
-    target_labels = tf.squeeze(target_labels, -1)
-    contributing_indices = tf.where(tf.equal(target_labels, 1))
-    target_deltas = tf.gather_nd(target_deltas, contributing_indices)
-    contributing_prediction = tf.gather_nd(predicted_deltas, contributing_indices)
-    loss = huber_loss(target_deltas,
-                      contributing_prediction)
-    # Zero batch size case
-    return K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
+def make_cls_processer(function, name=None):
+    def cls_processer(target_labels, predicted_labels):
+        """Ignores anchor boxes labeled as neutral during training
+        Receives:
+            target_labels: shape (batch_size, N)
+            predicted_deltas: shape (batch_size, N, 1)
+        Returns:
+            function result for all non-neutral samples"""
+        # We need to squeeze last dimension in order to not get shape mismatch,
+        # even though, length of last dim of predicted_labels is only one.
+        # Potential break with 1-sized batch until i figure out how to squeeze along last dimension only
+        # tf.squeeze(predicted_labels, -1 (or 2)) doesnt work as shapes somehow could not be
+        # received on graph launch
+        predicted_labels = tf.squeeze(predicted_labels)
+        # Find which targets contribute to the loss (targets with non-neutral labels)
+        contributing_indices = tf.where(tf.not_equal(target_labels, -1))
+        # Take contributing
+        target_labels = tf.gather_nd(target_labels, contributing_indices)
+        contributing_prediction = tf.gather_nd(predicted_labels, contributing_indices)
+        # Compute loss
+        loss = function(target_labels,
+                        contributing_prediction)
+        # Zero batch size case
+        return K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
+    if name is not None:
+        cls_processer.__name__ = name
+    return cls_processer
+
+
+def make_reg_processer(function, name=None):
+    def reg_processer(targets, predicted_deltas):
+        """Ignores anchor boxes labeled as negative or neutral
+        Receives:
+            targets: shape (batch_size, N, 5) - tensor, which contains labels at [:, :, 0]
+                                                and deltas at [:, :, 1:5]
+            predicted_deltas: shape (batch_size, N, 4)
+        Returns:
+            function result for all positive samples"""
+        # Extract labels, intentionally squeezed
+        target_labels = targets[:, :, 0]
+        # Extract deltas
+        target_deltas = targets[:, :, 1:]
+        # Find which targets contribute to the loss (targets with positive labels)
+        contributing_indices = tf.where(tf.equal(target_labels, 1))
+        # Take contributing
+        target_deltas = tf.gather_nd(target_deltas, contributing_indices)
+        contributing_prediction = tf.gather_nd(predicted_deltas, contributing_indices)
+        # Compute loss
+        loss = function(target_deltas,
+                        contributing_prediction)
+        # Zero batch size case
+        return K.switch(tf.size(loss) > 0, K.mean(loss), tf.constant(0.0))
+    if name is not None:
+        reg_processer.__name__ = name
+    return reg_processer
 
 
 def generate_anchor_boxes(sizes, scales, image_size, feature_map_size):
     """Generates all anchor boxes for current RPN configuration.
     Receives:
-        sizes [M] - all sizes of 1:1 anchor boxes
-        scales [S] - all sides ratios of anchor boxes
-        image_size (W, H)
-        feature_map_size (fW, fH)
-
+        sizes: shape (M) - all sizes of 1:1 anchor boxes
+        scales: shape (N) - all sides ratios of anchor boxes
+        image_size: (iW, iH)
+        feature_map_size: (fW, fH)
     Returns:
-        all_ab [N, x, y, w, h]"""
+        anchor_boxes: shape (K, 4) """
     image_width, image_height = image_size
-    width_stride, height_stride = np.floor(np.divide(image_size, feature_map_size)).astype(int)
+    fm_width, fm_height = feature_map_size
+    width_stride = int(image_width / fm_width)
+    height_stride = int(image_height / fm_height)
 
     # Compose horizontal and vertical positions into grid and reshape result into (-1, 2)
     x_centers = np.arange(0, image_width, width_stride)
@@ -83,22 +172,23 @@ def generate_anchor_boxes(sizes, scales, image_size, feature_map_size):
     # Creates anchor boxes pyramid. Somewhat vectorized version of itertools.product
     r_sides = np.repeat([sizes], len(scales), axis=1).ravel()
     r_scales = np.repeat([scales], len(sizes), axis=0).ravel()
-    ab_pyramid = np.transpose([r_sides * (r_scales ** .5) // 2,
-                               r_sides / (r_scales ** .5) // 2]).astype(int)
+    ab_pyramid = np.transpose([r_sides * (r_scales ** .5),
+                               r_sides / (r_scales ** .5)]).astype(int)
 
-    # Creates combinations of all anchor boxes centers and sides. Another product vectorization
+    # Creates combinations of all anchor boxes centers and sides
     r_centers = np.repeat(centers, len(ab_pyramid), axis=0)
     r_ab_pyramid = np.repeat([ab_pyramid], len(centers), axis=0).reshape((-1, 2))
-    return np.hstack(r_centers, r_ab_pyramid)
+    return np.hstack((r_centers, r_ab_pyramid))
 
 
 def valid_anchor_boxes(anchor_boxes, image_size):
-    """Return indices of valid anchor boxes
+    """Return indices of valid anchor boxes,
+    Anchor box is considered valid if it is inside image entirely
     Receives:
-        anchor_boxes [N, x, y, w, h] - all anchor boxes matrix
-        image_size (W, H)
+        anchor_boxes: shape (N, 4)
+        image_size: (iwidth, iheight)
     Returns:
-        indices [N]
+        indices shape (M)
         """
     img_width, img_height = image_size
     x, y, width, height = np.transpose(anchor_boxes)
@@ -110,17 +200,17 @@ def valid_anchor_boxes(anchor_boxes, image_size):
                            y + height // 2 <= img_height]).transpose()
 
     # Get indices of anchor boxes inside image
-    return np.nonzero(np.all(indicators, axis=0, keepdims=False))
+    return np.flatnonzero(np.all(indicators, axis=1, keepdims=False))
 
 
 def compute_iou(anchor_boxes, gt_boxes):
     """Computes IoU for every anchor box and a batch of ground-truth boxes
     Receives:
-        anchor_boxes [N, x, y, w, h]
-        gt_boxes [M, x0, y0, x1, y1]
+        anchor_boxes: shape (N, 4)
+        gt_boxes: shape (M, 4)
     Returns:
-        ious [N] - max ious for avery anchor box among all gt boxes
-        gt_boxes_index [N] - indices of chosen gt boxes"""
+        ious: shape(N) - max ious for avery anchor box among all gt boxes
+        gt_boxes_index: shape(N) - indices of chosen gt boxes"""
     x, y, width, height = np.transpose(anchor_boxes)
     ab_areas = width * height
 
@@ -146,9 +236,10 @@ def compute_iou(anchor_boxes, gt_boxes):
     # Transpose to make rows represent all ious for every gt box
     # and choose maximum iou with respective gt box index
     ious = np.transpose(ious)
-    gt_index = np.argmax(ious, axis=1)
-    ious = np.take(ious, gt_index).ravel()
-    return ious, gt_index
+    gt_indices = np.reshape(np.argmax(ious, axis=1), (-1, 1))
+    ious = np.squeeze(np.take_along_axis(ious, gt_indices, axis=1))
+    # No further need for gt_indices to be 2D array
+    return ious, np.squeeze(gt_indices)
 
 
 def compute_deltas(anchor_boxes, gt_boxes):
@@ -158,7 +249,7 @@ def compute_deltas(anchor_boxes, gt_boxes):
         gt_boxes [N, x0, y0, x1, y1]
     Returns:
         deltas [N, (gt_x_center - x) / w,
-                   (gt_y_centet - y) / h,
+                   (gt_y_center - y) / h,
                    log(gt_width / w),
                    log(gt_height / h)] - RPN-required deltas"""
     x, y, width, height = np.transpose(anchor_boxes)
@@ -169,18 +260,17 @@ def compute_deltas(anchor_boxes, gt_boxes):
     gt_height = y1 - y0
     gt_x_center = x0 + gt_width // 2
     gt_y_center = y0 + gt_height // 2
-    return np.array([(gt_x_center - x) / width,
-                     (gt_y_center - y) / height,
-                     np.log(gt_width / width),
-                     np.log(gt_height / height)])
+    return np.transpose([(gt_x_center - x) / width,
+                         (gt_y_center - y) / height,
+                         np.log(gt_width / width),
+                         np.log(gt_height / height)])
 
 
 def generate_labels_and_deltas(gt_boxes, anchor_boxes,
                                valid_indices,
                                lower_iou_threshold,
                                upper_iou_threshold,
-                               max_positive_samples,
-                               max_negative_samples,
+                               pos_to_neg_ratio,
                                random_generator):
     """Generate RPN training targets - labels and deltas
     Receives:
@@ -189,130 +279,96 @@ def generate_labels_and_deltas(gt_boxes, anchor_boxes,
         valid_indices [N] - indices of anchor boxes which will be used for computations
         lower_iou_threshold - Any anchor boxes with IoU above this threshold get '1' label (foreground)
         upper_iou_threshold - Any anchor boxes with IoU below this threshold get '1' label (foreground)
-        max_positive_samples - maximum anchor boxes labeled as '1'
-        max_negative_samples - maximum anchor boxes labeled as '0'
         random_generator - np random generator
     Returns:
         labels [N]
         deltas [N, dx, dy, dw, dh]"""
-    ious = np.zeros(anchor_boxes[0])
+    ious = np.zeros(anchor_boxes.shape[0])
 
     # Compute IoU for valid anchor boxes and get indices of respective gt boxes
     ious[valid_indices], gt_boxes_indices = compute_iou(anchor_boxes[valid_indices], gt_boxes)
     labels = np.full(ious.shape, -1)
 
-    # Positive samples
-    positive_indices = np.nonzero((ious > upper_iou_threshold)[valid_indices])
-    if len(positive_indices) > max_positive_samples:
-        positive_indices = random_generator.choice(positive_indices, max_positive_samples, replace=False)
+    # Positive samples. We find indices of positive samples in array of all anchor boxes
+    positive_indices = np.flatnonzero((ious > upper_iou_threshold)[valid_indices])
     labels[positive_indices] = 1
 
+    # Indices of respective gt_boxes in array of valid anchor boxes
+    gt_boxes_indices = gt_boxes_indices[ious[valid_indices] > upper_iou_threshold]
+
     # Negative samples
-    negative_indices = np.nonzero((ious < lower_iou_threshold)[valid_indices])
-    if len(negative_indices) > max_negative_samples:
-        negative_indices = random_generator.choice(negative_indices, max_negative_samples, replace=False)
+    max_negative_indices = int(len(positive_indices) / pos_to_neg_ratio)
+    negative_indices = np.flatnonzero((ious < lower_iou_threshold)[valid_indices])
+    if len(negative_indices) > max_negative_indices:
+        negative_indices = random_generator.choice(negative_indices,
+                                                   max_negative_indices,
+                                                   replace=False)
     labels[negative_indices] = 0
 
-    # Deltas are computed only for positive samples
-    gt_boxes = np.take(gt_boxes,
-                       gt_boxes_indices[ious[valid_indices] > upper_iou_threshold],
-                       axis=0)
-    deltas = np.zeros_like(anchor_boxes)
-    deltas[positive_indices] = compute_deltas(anchor_boxes[positive_indices],
-                                              gt_boxes)
+    # Find positions of positive gt boxes
+    gt_boxes = np.take(gt_boxes, gt_boxes_indices, axis=0)
+    deltas = np.zeros_like(anchor_boxes, dtype='float')
+    deltas[positive_indices] = compute_deltas(anchor_boxes[positive_indices], gt_boxes)
 
-    return labels, deltas
-
-
-def slow_rpn_generator(pretrained_model,
-                       image_data_generator,
-                       *,
-                       scales, sizes, seed,
-                       lower_iou_threshold,
-                       upper_iou_threshold,
-                       max_positive_samples,
-                       max_negative_samples,
-                       ):
-    """Generates RPN targets in a traditional way"""
-    # Receive image size and output layer size from pretrained model
-    image_size = pretrained_model.input_shape[1:3]
-    feature_map_size = pretrained_model.output_shape[1:3]
-
-    # Generate all anchor boxes beforehand
-    all_ab = generate_anchor_boxes(sizes, scales,
-                                   image_size,
-                                   feature_map_size)
-    valid_ab_indices = valid_anchor_boxes(all_ab,
-                                          image_size)
-    random_generator = np.random.Generator(seed)
-    for img_batch, gt_boxes_batch in image_data_generator:
-        # RPN receives feature maps
-        feature_maps = pretrained_model.predict(img_batch)
-        # TODO(Mocurin)
-        labels, deltas = np.apply_along_axis(generate_labels_and_deltas,
-                                             gt_boxes_batch, 0,
-                                             all_ab, valid_ab_indices,
-                                             lower_iou_threshold,
-                                             upper_iou_threshold,
-                                             max_positive_samples,
-                                             max_negative_samples,
-                                             random_generator)
-        labels = np.squeeze(labels)
-        deltas = np.squeeze(deltas)
-        yield feature_maps, [labels], [deltas, labels]
+    # Labels are 1D, deltas are a 2D, so we should expand labels dimensions
+    # Intentional, as loss function without lambdas (which are not usable in our
+    # case as we have to save and load models) receives only one tensor
+    return np.hstack((labels[:, np.newaxis], deltas))
 
 
-def greedy_non_maximum_suppression(anchor_boxes, scores, overlap_threshold):
-    """NMS, process RPN results to reduce useless and misleading regions for ROIP
+def prepare_rpn_anchor_boxes(image_size, feature_map_size, sizes, scales):
+    """Generate anchor boxes and indices of valid anchor boxes beforehand
     Receives:
-        anchor_boxes [N, x, y, w, h] - delta-adjusted anchor boxes
-        scores [N] - binary classification scores
-        overlap_threshold - maximum regions overlap
-    Возвращает:
-        picked_anchor_boxes [M, x, y, w, h]
-        picked_scores - [M]"""
-    x, y, width, height = np.transpose(anchor_boxes)
-    areas = width * height
-    w_shift = width // 2
-    h_shift = height // 2
-
-    # Transform anchor boxes to 'corners' format
-    x0 = x - w_shift
-    y0 = y - h_shift
-    x1 = x + w_shift
-    y1 = y + h_shift
-
-    sorted_indices = np.argsort(scores.ravel())
-    picked_indices = []
-    while len(sorted_indices) > 0:
-        # Take anchor box with highest score
-        last = sorted_indices[-1]
-        sorted_indices = sorted_indices[:-1]
-        picked_indices.append(last)
-
-        # Find intersection of taken anchor box with others
-        left = np.maximum(x0[last], x0[sorted_indices])
-        top = np.maximum(y0[last], y0[sorted_indices])
-        right = np.minimum(x1[last], x1[sorted_indices])
-        bottom = np.minimum(y1[last], y1[sorted_indices])
-
-        # Drop anchor boxes beyond overlap threshold
-        overlap = np.maximum(0, right - left) * np.maximum(0, top - bottom) / areas[sorted_indices]
-        sorted_indices = sorted_indices[overlap.ravel() < overlap_threshold]
-    return anchor_boxes[picked_indices], scores[picked_indices]
-
-
-def apply_deltas(all_anchor_boxes, all_deltas):
-    """Layer which applies deltas to anchor boxes
-    !!!Does not work with batches, needs to be applied along 0 axis!!!
-    Receives:
-        all_anchor_boxes [N, x, y, w. h]
-        all_deltas [N, dx, dy, dw, dh] - respective deltas
+        image_size (iwidth, iheight)
+        feature_map_size (fwidth, fheight)
+        sizes - array of 1:1 anchor box sides
+        scales - array of width to height ratios for anchor boxes
     Returns:
-        anchor_boxes [N, x, y, w, h]"""
-    x, y, width, height = np.transpose(all_anchor_boxes)
-    dx, dy, dw, dh = np.transpose(all_deltas)
-    return np.transpose([x + dx * width,
-                         y + dy * height,
-                         width * tf.exp(dw),
-                         height * tf.exp(dh)])
+        anchor_boxes [N [x, y, w, h]] - all image anchor boxes
+        valid_ab_indices [M, index] - indices of valid anchor boxes"""
+    anchor_boxes = generate_anchor_boxes(sizes, scales, image_size, feature_map_size)
+    valid_ab_indices = valid_anchor_boxes(anchor_boxes, image_size)
+    return anchor_boxes, valid_ab_indices
+
+
+def rpn_generator(data_generator, *,
+                  anchor_boxes,
+                  valid_ab_indices,
+                  lower_iou_threshold,
+                  upper_iou_threshold,
+                  pos_to_neg_ratio=0.5,
+                  seed=42
+    ):
+    """Generates RPN targets - feature maps and anchor boxes labels & deltas - in a traditional way
+    Receives:
+        data_generator - generator, returning feature maps and ground-truth boxes in batches
+        anchor_boxes [N, [x, y, w, h]] - all image anchor_boxes
+        valid_ab_indices [M, index] - indices of valid anchor_boxes
+        lower_iou_threshold - zero to one float, anchor_boxes with gt iou > this threshold
+                              will be labeled as positive ('1'/ 'foreground')
+        lower_iou_threshold - zero to one float, anchor_boxes with gt iou < this threshold
+                              will be labeled as negative ('0'/ 'background')
+        pos_to_neg_ratio - float, defines how much negative samples will be generated according
+                           to a number of positive samples.
+                           F.e: ptnr = 0.5,
+                                len(pos_samples) = 128
+                                len(negative_samples) = 128 / 0.5 = 256
+        seed - generator seed. Generator is isolated, so it will always give defined sequence of data
+    Returns:
+        spits out batches of feature maps and rpn targets in format
+            [batch_size, feature_maps],
+            [[batch_size, labels], [batch_size, [label, dx, dy, dw, dh]]"""
+    random_generator = np.random.default_rng(seed=seed)
+    for imgs_batch, gt_boxes_batch in data_generator:
+        # Generate bbox_reg targets
+        targets = np.array([generate_labels_and_deltas(gt_boxes,
+                                                       anchor_boxes,
+                                                       valid_ab_indices,
+                                                       lower_iou_threshold,
+                                                       upper_iou_threshold,
+                                                       pos_to_neg_ratio,
+                                                       random_generator)
+                            for gt_boxes in gt_boxes_batch])
+        # Intentionally squeezes last dimension
+        labels = targets[:, :, 0]
+        yield imgs_batch, [labels, targets]
