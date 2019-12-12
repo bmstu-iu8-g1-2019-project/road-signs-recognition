@@ -1,20 +1,28 @@
 import tensorflow as tf
+import keras.backend as K
 from keras.layers import Layer
+
+
+@tf.function
+def make_corners(regs):
+    x, y, w, h = tf.unstack(regs, axis=1)
+    w_str = w // 2
+    h_str = h // 2
+    return tf.stack([x - w_str, y - h_str, x + w_str, y + h_str], axis=1)
 
 
 class RegionOfInterestPooling(Layer):
     """Region of interest pooling layer implementation
+    Parameters:
+        target_size (target_width, target_height) - output feature map shape
+        image_size (image_width, image_height) - necessary as we are computing coordinates on
+                                                 feature map, rather then on input image
+        pooling_type 'max'/'min'/'mean' - pooling function to apply
     Receives:
-        input [feature_maps, regions]:
-            feature_maps [batch_size, feature_map] - fms from feature extractor
-            regions [batch_size, [regions_number, [x, y, w, h]]] - regions after NMSa
-        parameters:
-            target_size (target_width, target_height) - output fm shape
-            image_size (image_width, image_height) - necessary as we are computing coordinates on
-                                                     feature map, rather then on input image
-            pooling_type 'max'/'min'/'mean' - pooling function to apply
+        feature_maps: (batch_size, fm_width, fm_height, fm_depth) - feature extractor output
+        regions: (batch_size, rois_number, 4) - regions after NMS application
     Returns:
-        pooled_regions [batch_size, [regions_number, fm_crop]]"""
+        output: (batch_size, rois_number, target_width, target_height, fm_depth)"""
     _pool_types = {'max': tf.math.reduce_max, 'min': tf.math.reduce_min, 'mean': tf.math.reduce_mean}
 
     def __init__(self, target_size, image_size, pooling_type='max', **kwargs):
@@ -35,18 +43,9 @@ class RegionOfInterestPooling(Layer):
         return batch_size, regions_number, self.target_width, self.target_height, depth
 
     def call(self, input):
-        feature_maps = input[0]
-        regions = input[1]
+        feature_maps, regions = input
         batch_size, fm_width, fm_height = tf.shape(feature_maps)[:3]
 
-        def make_corners(regs):
-            x, y, w, h = tf.unstack(regs, axis=1)
-            w_str = w // 2
-            h_str = h // 2
-            return tf.stack([x - w_str,
-                             y - h_str,
-                             x + w_str,
-                             y + h_str], axis=1)
         # Whole regions batch is now in 'corners' format
         regions = tf.map_fn(make_corners, regions)
 
@@ -92,67 +91,122 @@ class RegionOfInterestPooling(Layer):
 
 
 class NonMaximumSuppression(Layer):
-    def __init__(self, overlap_threshold, regions_number, **kwargs):
-        self.overlap_threshold = overlap_threshold
-        self.regions_number = regions_number
+    """Calls NMS for every sample and pads received region batches with random regions
+    Parameters:
+        iou_threshold, score_threshold, rois_number(max_output_size) are tf.non_maximum_suppression parameters
+    Receives:
+        input: (batch_size, valid_ab_number, 5) - tensor of scores and respective regions
+    Returns:
+        output: (batch_size, rois_number, 4) - NMS`ed regions tensor"""
+    def __init__(self,
+                 iou_threshold=0.5,
+                 rois_number=256,
+                 score_threshold=float('-inf'),
+                 return_indices=False,
+                 **kwargs):
+        self.iou_threshold = iou_threshold
+        self.score_threshold = score_threshold
+        self.rois_number = rois_number
+        self.return_indices = tf.cast(return_indices, tf.bool)
         super(NonMaximumSuppression, self).__init__(**kwargs)
 
     def compute_output_shape(self, input_shape):
-        return input_shape[0], self.regions_number, 4
+        """NMS is padded, so layer always returns fixed number of regions"""
+        return K.switch(self.return_indices, (input_shape[0], self.rois_number, 1), (input_shape[0], self.rois_number, 4))
 
     def call(self, input):
         def nms_wrapper(predictions):
             scores = predictions[:, 0]
-            regions = predictions[:, 1:]
-            indices = self._nms(scores, regions)
-            return predictions[indices, 2:]
-        # Does work with fixed regions number. Now does not
+            regions = make_corners(predictions[:, 1:])
+            indices = tf.image.non_max_suppression(regions, scores,
+                                                   self.rois_number,
+                                                   self.iou_threshold,
+                                                   self.score_threshold)
+            def pad(ind):
+                missing = self.rois_number - tf.size(ind)
+                padding = tf.random.uniform([missing],
+                                            minval=0,
+                                            maxval=tf.shape(regions)[0],
+                                            dtype=tf.int32)
+                return tf.concat([ind, padding], axis=0)
+            # Pad NMS`ed indices with random indices to make layer output shape fixed.
+            result_indices = K.switch(tf.size(indices) < self.rois_number, pad(indices), indices)
+            return K.switch(self.return_indices, result_indices, tf.gather(predictions, result_indices)[:, 1:])
         return tf.map_fn(nms_wrapper, input)
 
-    def _nms(self, scores, regions):
-        left, top, right, bottom = tf.unstack(regions, axis=1)
-        areas = (right - left) * (bottom - top)
 
-        sorted_indices = tf.argsort(scores)
-        picked_indices = []
-        while tf.size(sorted_indices) > 0:
-            # Take anchor box with highest score
-            last = sorted_indices[-1]
-            sorted_indices = sorted_indices[:-1]
-            picked_indices.append(last)
-
-            # Find intersection of taken anchor box with others
-            left = tf.maximum(left[last], left[sorted_indices])
-            top = tf.maximum(top[last], top[sorted_indices])
-            right = tf.minimum(right[last], right[sorted_indices])
-            bottom = tf.minimum(bottom[last], bottom[sorted_indices])
-
-            # Drop anchor boxes beyond overlap threshold
-            overlap = tf.maximum(0, right - left) * tf.maximum(0, top - bottom) / areas[sorted_indices]
-            sorted_indices = sorted_indices[overlap.ravel() < self.overlap_threshold]
-        return picked_indices
-
-
-class ValidateRegions(Layer):
-    def __init__(self, all_anchor_boxes, **kwargs):
-        self.anchor_boxes = all_anchor_boxes
-        super(ValidateRegions, self).__init__(**kwargs)
+class IndNonMaximumSuppression(Layer):
+    """Calls NMS for every sample and pads received region batches with random regions
+    Parameters:
+        iou_threshold, score_threshold, rois_number(max_output_size) are tf.non_maximum_suppression parameters
+    Receives:
+        input: (batch_size, valid_ab_number, 5) - tensor of scores and respective regions
+    Returns:
+        output: (batch_size, rois_number, 4) - NMS`ed regions tensor"""
+    def __init__(self,
+                 iou_threshold=0.5,
+                 rois_number=256,
+                 score_threshold=float('-inf'),
+                 return_indices=False,
+                 **kwargs):
+        self.iou_threshold = iou_threshold
+        self.score_threshold = score_threshold
+        self.rois_number = rois_number
+        super(IndNonMaximumSuppression, self).__init__(**kwargs)
 
     def compute_output_shape(self, input_shape):
-        # For sake of convenience merges scores and deltas tensor
-        return input_shape[0], 5
+        """NMS is padded, so layer always returns fixed number of regions"""
+        return input_shape[0], self.rois_number, 1
 
     def call(self, input):
-        scores = input[0]
-        deltas = input[1]
+        def nms_wrapper(predictions):
+            scores = predictions[:, 0]
+            regions = make_corners(predictions[:, 1:])
+            indices = tf.image.non_max_suppression(regions, scores,
+                                                   self.rois_number,
+                                                   self.iou_threshold,
+                                                   self.score_threshold)
+            def pad(ind):
+                missing = self.rois_number - tf.size(ind)
+                padding = tf.random.uniform([missing],
+                                            minval=0,
+                                            maxval=tf.shape(regions)[0],
+                                            dtype=tf.int32)
+                return tf.concat([ind, padding], axis=0)
+            # Pad NMS`ed indices with random indices to make layer output shape fixed.
+            return K.switch(tf.size(indices) < self.rois_number, pad(indices), indices)
+        return tf.map_fn(nms_wrapper, input, dtype=tf.int32)
+
+
+class ApplyDeltas(Layer):
+    """Picks valid regions, applies deltas for them, transforms regions to 'corners' format and merges
+    scores and regions into one tensor
+    Parameters:
+        anchor_boxes: (ab_number, 4) - all image anchor boxes
+        valid_anchor_boxes: (valid_ab_number) - indices of valid anchor boxes
+    Receives:
+        scores: (batch_size, ab_number) - RPN region scores
+        deltas: (batch_size, ab_number, 4) - RPN region deltas
+    Returns:
+        regions: (batch_size, valid_ab_number, 4) - regions in [x, y, w, h] format"""
+    def __init__(self, anchor_boxes, valid_indices, **kwargs):
+        self.valid_anchor_boxes = tf.cast(anchor_boxes[valid_indices], tf.float32)
+        self.valid_indices = valid_indices
+        super(ApplyDeltas, self).__init__(**kwargs)
+
+    def compute_output_shape(self, input_shape):
+        # For sake of convenience merges scores and regions tensor
+        return input_shape[0], len(self.valid_indices), 5
+
+    def call(self, input):
+        scores, deltas = input
+        scores = tf.gather(scores, self.valid_indices, axis=1)
+        deltas = tf.gather(deltas, self.valid_indices, axis=1)
+        x, y, w, h = tf.unstack(self.valid_anchor_boxes, axis=1)
 
         def apply_deltas(inp):
-            x, y, w, h = tf.unstack(self.anchor_boxes, axis=1)
             dx, dy, dw, dh = tf.unstack(inp, axis=1)
-            return tf.stack([x + dx * w,
-                             y + dy * h,
-                             w * tf.exp(dw),
-                             h * tf.exp(dh)], axis=1)
-
+            return tf.stack([x + dx * w, y + dy * h, w * tf.exp(dw), h * tf.exp(dh)], axis=1)
         regions = tf.map_fn(apply_deltas, deltas)
         return tf.concat([scores[:, :, tf.newaxis], regions], axis=2)
+
