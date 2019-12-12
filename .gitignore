@@ -5,4 +5,11 @@
 /.idea/
 /__pycache__/
 /sources/__pycache__/
-/results/
+/full.csv
+/new-full-gt.csv
+/weights.csv
+/feature_extractor/
+/feature_extractor/__pycache__/
+/rpn/versions/
+/rpn/__pycache__/
+/tests/
