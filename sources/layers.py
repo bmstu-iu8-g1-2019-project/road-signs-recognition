@@ -5,10 +5,10 @@ from keras.layers import Layer
 
 @tf.function
 def make_corners(regs):
-    x, y, w, h = tf.unstack(regs, axis=1)
+    y, x, h, w = tf.unstack(regs, axis=1)
     w_str = w // 2
     h_str = h // 2
-    return tf.stack([x - w_str, y - h_str, x + w_str, y + h_str], axis=1)
+    return tf.stack([y - h_str, x - w_str, y + h_str, x + w_str], axis=1)
 
 
 class RegionOfInterestPooling(Layer):
@@ -89,7 +89,7 @@ class RegionOfInterestPooling(Layer):
                           for cell_reg in grid_row]
                          for grid_row in crop_grid])
 
-
+git
 class NonMaximumSuppression(Layer):
     """Calls NMS for every sample and pads received region batches with random regions
     Parameters:
@@ -202,11 +202,11 @@ class ApplyDeltas(Layer):
         scores, deltas = input
         scores = tf.gather(scores, self.valid_indices, axis=1)
         deltas = tf.gather(deltas, self.valid_indices, axis=1)
-        x, y, w, h = tf.unstack(self.valid_anchor_boxes, axis=1)
+        y, x, h, w = tf.unstack(self.valid_anchor_boxes, axis=1)
 
         def apply_deltas(inp):
-            dx, dy, dw, dh = tf.unstack(inp, axis=1)
-            return tf.stack([x + dx * w, y + dy * h, w * tf.exp(dw), h * tf.exp(dh)], axis=1)
+            dy, dx, dh, dw = tf.unstack(inp, axis=1)
+            return tf.stack([y + dy * h, x + dx * w, h * tf.exp(dh), w * tf.exp(dw)], axis=1)
         regions = tf.map_fn(apply_deltas, deltas)
         return tf.concat([scores[:, :, tf.newaxis], regions], axis=2)
 

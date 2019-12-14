@@ -1,4 +1,6 @@
 import os
+import numpy as np
+from keras.preprocessing.image import load_img
 
 
 def versionize(versions_dir,
@@ -16,3 +18,8 @@ def versionize(versions_dir,
         dirs.append(version_path + name + '/')
         os.mkdir(dirs[-1])
     return version_path, dirs
+
+
+if __name__ == '__main__':
+    img = load_img('../dataset/validation/0000000.jpg', target_size=(1280, 720))
+    img.show()
