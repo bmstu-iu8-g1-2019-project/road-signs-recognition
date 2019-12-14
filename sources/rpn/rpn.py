@@ -1,4 +1,4 @@
-from keras.layers import Conv2D, Activation, Reshape
+from keras.layers import Conv2D, Reshape
 from keras.models import Model
 from keras.initializers import he_uniform, glorot_uniform
 from keras.regularizers import Regularizer
@@ -10,15 +10,12 @@ import numpy as np
 def training_rpn_model(feature_extractor, anchors_per_loc, seed):
     conv_init = he_uniform(seed)
     cls_reg_init = glorot_uniform(seed)
-    reg_3x3 = ThresholdedRegularizer(penalty=0.1, threshold=0.5, kernel_shape=(3, 3, 64))
-    reg_1x1 = ThresholdedRegularizer(penalty=0.1, threshold=0.1)
 
     conv = Conv2D(
         filters=128,
         kernel_size=(3, 3),
         padding='same',
         kernel_initializer=conv_init,
-        kernel_regularizer=reg_3x3,
         activation='relu',
         name='RPN_conv'
     )(feature_extractor.output)
@@ -26,7 +23,6 @@ def training_rpn_model(feature_extractor, anchors_per_loc, seed):
         filters=1 * anchors_per_loc,
         kernel_size=(1, 1),
         kernel_initializer=cls_reg_init,
-        kernel_regularizer=reg_1x1,
         activation='sigmoid',
         name='RPN_cls'
     )(conv)
@@ -34,7 +30,6 @@ def training_rpn_model(feature_extractor, anchors_per_loc, seed):
         filters=4 * anchors_per_loc,
         kernel_size=(1, 1),
         kernel_initializer=cls_reg_init,
-        kernel_regularizer=reg_1x1,
         activation=expanded_sigmoid,
         name='RPN_reg'
     )(conv)

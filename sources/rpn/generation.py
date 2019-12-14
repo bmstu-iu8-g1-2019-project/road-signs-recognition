@@ -46,25 +46,25 @@ def generate_anchor_boxes(image_size, feature_map_size, sizes, scales):
     Receives:
         sizes: sizes of 1:1 anchor boxes
         scales: sides ratios of anchor boxes
-        image_size: (iW, iH)
-        feature_map_size: (fW, fH)
+        image_size: (iH, iW)
+        feature_map_size: (fH, fW)
     Returns:
         anchor_boxes: shape (N, 4) """
-    image_width, image_height = image_size
-    fm_width, fm_height = feature_map_size
-    width_stride = int(image_width / fm_width)
+    image_height, image_width = image_size
+    fm_height, fm_width = feature_map_size
     height_stride = int(image_height / fm_height)
+    width_stride = int(image_width / fm_width)
 
     # Compose horizontal and vertical positions into grid and reshape result into (-1, 2)
-    x_centers = np.arange(0, image_width, width_stride)
     y_centers = np.arange(0, image_height, height_stride)
-    centers = np.dstack(np.meshgrid(x_centers, y_centers)).reshape((-1, 2))
+    x_centers = np.arange(0, image_width, width_stride)
+    centers = np.dstack(np.meshgrid(y_centers, x_centers)).reshape((-1, 2))
 
     # Creates anchor boxes pyramid. Somewhat vectorized version of itertools.product
-    r_sides = np.repeat([sizes], len(scales), axis=1).ravel()
     r_scales = np.repeat([scales], len(sizes), axis=0).ravel()
-    ab_pyramid = np.transpose([r_sides * (r_scales ** .5),
-                               r_sides / (r_scales ** .5)]).astype(int)
+    r_sides = np.repeat([sizes], len(scales), axis=1).ravel()
+    ab_pyramid = np.transpose([r_sides / (r_scales ** .5),
+                               r_sides * (r_scales ** .5)]).astype(int)
 
     # Creates combinations of all anchor boxes centers and sides
     r_centers = np.repeat(centers, len(ab_pyramid), axis=0)
@@ -77,19 +77,19 @@ def valid_anchor_boxes(anchor_boxes, image_size):
     Anchor box is considered valid if it is inside image entirely
     Receives:
         anchor_boxes: shape (N, 4)
-        image_size: (iW, iH)
+        image_size: (iH, iW)
     Returns:
         indices shape (M)
         """
-    img_width, img_height = image_size
-    x, y, width, height = np.transpose(anchor_boxes)
+    img_height, img_width = image_size
+    y, x, height, width = np.transpose(anchor_boxes)
 
     # TODO(Mocurin) Optimize?
     # Indicator matrix
-    indicators = np.array([x - width // 2 >= 0,
-                           y - height // 2 >= 0,
-                           x + width // 2 <= img_width,
-                           y + height // 2 <= img_height]).transpose()
+    indicators = np.array([y - height // 2 >= 0,
+                           x - width // 2 >= 0,
+                           y + height // 2 <= img_height,
+                           x + width // 2 <= img_width]).transpose()
 
     # Get indices of anchor boxes inside image
     return np.flatnonzero(np.all(indicators, axis=1, keepdims=False))
@@ -103,22 +103,22 @@ def compute_deltas(anchor_boxes, gt_boxes):
     Returns:
         deltas: shape (n, 4)
         These 4 are:
-            dx = gt_x_center - x) / w
             dy = gt_y_center - y) / h
-            dw = log(gt_width / w)
-            dh = log(gt_height / h)"""
-    x, y, width, height = np.transpose(anchor_boxes)
-    x0, y0, x1, y1 = np.transpose(gt_boxes)
+            dx = gt_x_center - x) / w
+            dh = log(gt_height / h)
+            dw = log(gt_width / w)"""
+    y, x, height, width = np.transpose(anchor_boxes)
+    y0, x0, y1, x1 = np.transpose(gt_boxes)
 
     # Gt boxes should be in 'center' format
-    gt_width = x1 - x0
     gt_height = y1 - y0
-    gt_x_center = x0 + gt_width // 2
+    gt_width = x1 - x0
     gt_y_center = y0 + gt_height // 2
-    return np.transpose([(gt_x_center - x) / width,
-                         (gt_y_center - y) / height,
-                         np.log(gt_width / width),
-                         np.log(gt_height / height)])
+    gt_x_center = x0 + gt_width // 2
+    return np.transpose([(gt_y_center - y) / height,
+                         (gt_x_center - x) / width,
+                         np.log(gt_height / height),
+                         np.log(gt_width / width)])
 
 # TODO(Mocurin) Unify metrics, same with detector
 
@@ -128,21 +128,21 @@ def create_pos_overlap_metric(anchor_boxes):
     so it is done beforehand in this decorator
     PositiveOverlapMetric is a part of IoU metric.
     It is computed as a ratio of intersection area to positive region area (ground-truth box)"""
-    x, y, w, h = np.transpose(anchor_boxes)
-    x0 = x - w // 2
+    y, x, h, w = np.transpose(anchor_boxes)
     y0 = y - h // 2
-    x1 = x + w // 2
+    x0 = x - w // 2
     y1 = y + h // 2
+    x1 = x + w // 2
 
     def pos_overlap(gt_boxes):
         pos_overlaps = []
         for gt_box in gt_boxes:
-            gt_x0, gt_y0, gt_x1, gt_y1 = gt_box
+            gt_y0, gt_x0, gt_y1, gt_x1 = gt_box
             gt_area = (gt_x1 - gt_x0) * (gt_y1 - gt_y0)
-            int_x0 = np.maximum(gt_x0, x0)
             int_y0 = np.maximum(gt_y0, y0)
-            int_x1 = np.minimum(gt_x1, x1)
+            int_x0 = np.maximum(gt_x0, x0)
             int_y1 = np.minimum(gt_y1, y1)
+            int_x1 = np.minimum(gt_x1, x1)
             int_area = np.maximum(0, int_x1 - int_x0) * np.maximum(0, int_y1 - int_y0)
             pos_overlaps.append(int_area / gt_area)
         # Group by anchor boxes
@@ -162,21 +162,21 @@ def create_overlap_metric(anchor_boxes):
     so it is done beforehand in this decorator
     OverlapMetric is a part of IoU metric.
     It is computed as a ratio of intersection area to negative region area (anchor box)"""
-    x, y, w, h = np.transpose(anchor_boxes)
+    y, x, h, w = np.transpose(anchor_boxes)
     ab_area = w * h
-    x0 = x - w // 2
     y0 = y - h // 2
-    x1 = x + w // 2
+    x0 = x - w // 2
     y1 = y + h // 2
+    x1 = x + w // 2
 
     def overlap(gt_boxes):
         overlaps = []
         for gt_box in gt_boxes:
-            gt_x0, gt_y0, gt_x1, gt_y1 = gt_box
-            int_x0 = np.maximum(gt_x0, x0)
+            gt_y0, gt_x0, gt_y1, gt_x1 = gt_box
             int_y0 = np.maximum(gt_y0, y0)
-            int_x1 = np.minimum(gt_x1, x1)
+            int_x0 = np.maximum(gt_x0, x0)
             int_y1 = np.minimum(gt_y1, y1)
+            int_x1 = np.minimum(gt_x1, x1)
             int_area = np.maximum(0, int_x1 - int_x0) * np.maximum(0, int_y1 - int_y0)
             overlaps.append(int_area / ab_area)
         overlaps = np.transpose(overlaps)
@@ -191,22 +191,22 @@ def create_iou_metric(anchor_boxes):
     """In RPN generation metric computation is happening for all valid anchor boxes,
     so it is done beforehand in this decorator
     IoU is computed as a ratio of intersection area to a regions union area"""
-    x, y, w, h = np.transpose(anchor_boxes)
+    y, x, h, w = np.transpose(anchor_boxes)
     ab_areas = w * h
-    x0 = x - w // 2
     y0 = y - h // 2
-    x1 = x + w // 2
+    x0 = x - w // 2
     y1 = y + h // 2
+    x1 = x + w // 2
 
     def iou(gt_boxes):
         ious = []
         for gt_box in gt_boxes:
-            gt_x0, gt_y0, gt_x1, gt_y1 = gt_box
+            gt_y0, gt_x0, gt_y1, gt_x1 = gt_box
             gt_area = (gt_x1 - gt_x0) * (gt_y1 - gt_y0)
-            int_x0 = np.maximum(gt_x0, x0)
             int_y0 = np.maximum(gt_y0, y0)
-            int_x1 = np.minimum(gt_x1, x1)
+            int_x0 = np.maximum(gt_x0, x0)
             int_y1 = np.minimum(gt_y1, y1)
+            int_x1 = np.minimum(gt_x1, x1)
             int_area = np.maximum(0, int_x1 - int_x0) * np.maximum(0, int_y1 - int_y0)
             ious.append(int_area / (ab_areas + gt_area - int_area))
         ious = np.transpose(ious)

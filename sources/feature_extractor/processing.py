@@ -24,7 +24,6 @@ def prepare_feature_extractor(model,
     """
     config = model.get_config()
     weights = model.get_weights()
-
     # Edit input layer
     config['layers'][0]['config']['batch_input_shape'] = (None, *input_shape)
 
