@@ -5,7 +5,7 @@ from keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Dropout, Input
 from keras.losses import categorical_crossentropy
 from keras.preprocessing.image import ImageDataGenerator
 from playsound import playsound
-from sources.tools import compute_class_weights, cls_wrapper, class_indices, class_weights_array, threadsafe_generator
+from sources.tools import compute_class_weights, cls_wrapper, class_indices, class_weights_array
 
 input = Input(shape=(64, 64, 3), name='Input')
 output = Conv2D(filters=32,
@@ -127,14 +127,12 @@ classes_w = compute_class_weights(
     count_label='count'
 )
 
-threadsafe_cls_wrapper = threadsafe_generator(cls_wrapper)
-
-model.fit_generator(threadsafe_cls_wrapper(train_generator, classes_ind),
+model.fit_generator(cls_wrapper(train_generator, classes_ind),
                     steps_per_epoch=len(train_generator),
-                    validation_data=threadsafe_cls_wrapper(validation_generator, classes_ind),
+                    validation_data=cls_wrapper(validation_generator, classes_ind),
                     validation_steps=len(validation_generator),
                     class_weight=class_weights_array(classes_ind, classes_w),
-                    epochs=500, verbose=1, workers=4,
+                    epochs=500, verbose=1,
                     callbacks=[csv_logger, checkpoints, best_checkpoint, tb_logger])
 
 playsound('../misc/microwave.mp3')

@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import threading
 
 
 def compute_class_weights(filename, *, name_label, count_label):
@@ -59,28 +58,3 @@ def class_weights_array(cls_indices_dict, cls_weights_dict):
         ind = cls_indices_dict[key]
         arr[ind] = value
     return arr
-
-
-class threadsafe_iter:
-    """Takes an iterator/generator and makes it thread-safe by
-    serializing call to the `next` method of given iterator/generator.
-    """
-    def __init__(self, it):
-        self.it = it
-        self.lock = threading.Lock()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        with self.lock:
-            return next(self.it)
-
-
-def threadsafe_generator(f):
-    """A decorator that takes a generator function and makes it thread-safe.
-    """
-    def g(*a, **kw):
-        return threadsafe_iter(f(*a, **kw))
-    return g
-

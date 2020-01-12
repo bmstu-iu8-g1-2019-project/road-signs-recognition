@@ -2,7 +2,7 @@ import pandas as pd
 from keras.models import load_model
 from keras_preprocessing.image import ImageDataGenerator
 from playsound import playsound
-from sources.tools import cls_wrapper, class_indices, threadsafe_generator
+from sources.tools import cls_wrapper, class_indices
 
 model = load_model('../results/models/best.h5')
 
@@ -16,8 +16,7 @@ test_generator = ImageDataGenerator(rescale=1. / 255).flow_from_dataframe(
 
 classes = pd.read_csv('../dataset/counts.csv')['class']
 classes_ind = class_indices(classes.values)
-threadsafe_cls_wrapper = threadsafe_generator(cls_wrapper)
 
-print(model.evaluate_generator(generator=threadsafe_cls_wrapper(test_generator, classes_ind),
+print(model.evaluate_generator(generator=cls_wrapper(test_generator, classes_ind),
                                steps=len(test_generator), verbose=1, workers=4))
 playsound('misc/microwave.mp3')
